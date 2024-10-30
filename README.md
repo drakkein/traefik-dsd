@@ -5,6 +5,9 @@ Basic implementation to discover containers over docker sock that are running co
 
 **DISCLAIMER: If you looking for stable solution it is advertised to use [traefik-kop](https://github.com/jittering/traefik-kop).**
 
+# Prequesites
+To use traefik-dsd you need to init swarm mode and create overlay network. Traefik and all containers must be in the same overlay network.
+
 # Usage
 ```yaml
 services:
@@ -32,3 +35,15 @@ networks:
   traefik-public:
     external: true
 ```
+
+Test on `traefik machine`
+```bash
+curl -v -H "Host: myapp.example.com" http://127.0.0.1/
+```
+
+# Configuration
+|Variable|Description|Default|
+|-|-|-|
+|REDIS_URL|URL to your `redis/valkey` instance|-|
+|DOCKER_NETWORK|Name of your overlay network|-|
+|REDIS_TTL|Expiry time of created records. Discovery loop starts 5s before| 60|
