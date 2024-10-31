@@ -1,42 +1,39 @@
 use axum::body::Body;
+use http_body_util::BodyExt;
 use hyper::http::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
+use serde_json;
 use serde_json::Value;
 use std::path::PathBuf;
 use tokio::net::UnixStream;
-use serde_json;
-use http_body_util::BodyExt;
 
 pub struct Client<'a> {
     sender: hyper::client::conn::http1::SendRequest<Body>,
     docker_network: &'a str,
 }
 
-#[derive(Debug)]
-pub struct Container {
-    pub service_name: String,
-    pub service_container_index: i32,
-    pub service_url: String,
-    pub traefik_router_rule: String,
-}
-
 impl<'a> Client<'a> {
     pub async fn new(docker_network: &'a str) -> Result<Self, Box<dyn std::error::Error>> {
         let path = PathBuf::from("/var/run/docker.sock");
         let stream = TokioIo::new(UnixStream::connect(path).await?);
-        
+
         let (sender, conn) = hyper::client::conn::http1::handshake(stream).await?;
-        
+
         tokio::task::spawn(async move {
             if let Err(err) = conn.await {
                 eprintln!("Connection failed: {:?}", err);
             }
         });
 
-        Ok(Client { sender, docker_network })
+        Ok(Client {
+            sender,
+            docker_network,
+        })
     }
 
-    pub async fn get_containers(&mut self) -> Result<Vec<Container>, Box<dyn std::error::Error>> {
+    pub async fn get_containers(
+        &mut self,
+    ) -> Result<Vec<Vec<(String, String)>>, Box<dyn std::error::Error>> {
         let request = Request::builder()
             .method(Method::GET)
             .uri("/containers/json")
@@ -54,54 +51,140 @@ impl<'a> Client<'a> {
         Ok(containers)
     }
 
-    fn parse_containers(&mut self, json: Value) -> Vec<Container> {
-        json.as_array().unwrap_or(&vec![])
+    fn is_valid_container(&self, container: &Value) -> bool {
+        container["NetworkSettings"]["Networks"]
+            .as_object()
+            .map(|networks| networks.contains_key(self.docker_network))
+            .unwrap_or(false)
+            && container["Labels"]
+                .as_object()
+                .map(|labels| labels.contains_key("com.docker.compose.service"))
+                .unwrap_or(false)
+            && container["Labels"]
+                .as_object()
+                .map(|labels| labels.contains_key("traefik.enable"))
+                .unwrap_or(false)
+    }
+
+    fn build_lb_server_configuration(
+        &self,
+        labels: &Vec<(String, String)>,
+        network_ip: &str,
+        container_number_label: &str,
+    ) -> Option<(String, String)> {
+        let lb_service_name = labels
+            .iter()
+            .find(|(k, _)| k.ends_with("/loadbalancer/server/port"))
+            .map(|(k, _)| {
+                k.split("/")
+                    .nth(3)
+                    .expect("service name not found in traefik label")
+                    .to_string()
+            })
+            .or_else(|| None);
+
+        let lb_service_port = labels
+            .iter()
+            .find(|(k, _)| k.ends_with("/loadbalancer/server/port"))
+            .map(|(_, v)| v.as_str())
+            .or_else(|| None);
+
+        match (lb_service_name, lb_service_port) {
+            (Some(service_name), Some(service_port)) => {
+                let service_url = format!("http://{}:{}", network_ip, service_port);
+                let service_container_index = container_number_label.parse::<i32>().unwrap() - 1;
+
+                Some((
+                    format!(
+                        "traefik/http/services/{}/loadBalancer/servers/{}/url",
+                        service_name, service_container_index
+                    ),
+                    service_url,
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    fn build_router_service_configuration(
+        &self,
+        labels: &Vec<(String, String)>,
+    ) -> Option<(String, String)> {
+        let service_name = labels
+            .iter()
+            .find(|(k, _)| k.starts_with("traefik/http/routers/"))
+            .map(|(k, _)| {
+                k.split("/")
+                    .nth(3)
+                    .expect("service name not found in traefik label")
+                    .to_string()
+            })
+            .or_else(|| None);
+
+        match service_name {
+            Some(service_name) => Some((
+                format!("traefik/http/routers/{}/service", service_name),
+                service_name.into(),
+            )),
+
+            _ => None,
+        }
+    }
+
+    fn parse_containers(&mut self, json: Value) -> Vec<Vec<(String, String)>> {
+        json.as_array()
+            .unwrap_or(&vec![])
             .iter()
             .filter_map(|container| {
-            // Check if the container is connected to the specified network
-            if !container["NetworkSettings"]["Networks"].as_object()
-                .map(|networks| networks.contains_key(self.docker_network))
-                .unwrap_or(false) {
-                return None;
-            }
+                if !self.is_valid_container(container) {
+                    return None;
+                }
 
-            // Check if the container is a service
-            if !container["Labels"].as_object()
-                .map(|labels| labels.contains_key("com.docker.compose.service"))
-                .unwrap_or(false) {
-                return None;
-            }
+                let mut traefik_labels: Vec<(String, String)> = container["Labels"]
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .filter(|(k, _)| k.starts_with("traefik.http."))
+                    .map(|(k, v)| {
+                        (
+                            k.to_string().replace(".", "/"),
+                            v.clone().as_str().unwrap().to_string(),
+                        )
+                    })
+                    .collect();
 
-            // Check if traefik is enabled for the container
-            if !container["Labels"].as_object()
-                .map(|labels| labels.get("traefik.enable").map(|v| v == "true").unwrap_or(false))
-                .unwrap_or(false) {
-                return None;
-            }
+                let container_network_ip = container["NetworkSettings"]["Networks"]
+                    [self.docker_network]["IPAddress"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
 
-            // Parse required fields
-            let service_name = container["Labels"]["com.docker.compose.service"].as_str().unwrap().to_string();
-            let container_network_ip = container["NetworkSettings"]["Networks"][self.docker_network]["IPAddress"].as_str().unwrap().to_string();
-            let container_number_label = container["Labels"]["com.docker.compose.container-number"].as_str().unwrap(); 
-            let service_container_index = container_number_label.parse::<i32>().unwrap() - 1;
-    
-            let port_label = format!("traefik.http.services.{}.loadbalancer.server.port", service_name);
-            let rule_label = format!("traefik.http.routers.{}.rule", service_name);
-    
-    
-            let traefik_port = container["Labels"][port_label].as_str().unwrap();
-            let service_url = format!("http://{}:{}", container_network_ip, traefik_port);
-            let service_url = service_url.as_str().to_string();
-    
-            let traefik_router_rule = container["Labels"][rule_label].as_str().unwrap().to_string();
+                let container_number_label = container["Labels"]
+                    ["com.docker.compose.container-number"]
+                    .as_str()
+                    .unwrap();
 
-            Some(Container {
-                service_name,
-                service_container_index,
-                service_url,
-                traefik_router_rule,
+                let lb_config = self.build_lb_server_configuration(
+                    &traefik_labels,
+                    &container_network_ip,
+                    container_number_label,
+                );
+
+                if lb_config.is_some() {
+                    traefik_labels.push(lb_config.unwrap());
+                }
+
+                let router_service_config =
+                    self.build_router_service_configuration(&traefik_labels);
+
+                if router_service_config.is_some() {
+                    traefik_labels.push(router_service_config.unwrap());
+                }
+
+                traefik_labels.retain(|(k, _)| !k.ends_with("/loadbalancer/server/port"));
+
+                Some(traefik_labels)
             })
-        })
-        .collect()
+            .collect()
     }
 }
