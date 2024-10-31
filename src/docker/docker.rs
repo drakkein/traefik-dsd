@@ -1,6 +1,7 @@
 use axum::body::Body;
 use http_body_util::BodyExt;
 use hyper::http::{Method, Request, StatusCode};
+use hyper::service;
 use hyper_util::rt::TokioIo;
 use serde_json;
 use serde_json::Value;
@@ -69,28 +70,22 @@ impl<'a> Client<'a> {
     fn build_lb_server_configuration(
         &self,
         labels: &Vec<(String, String)>,
+        service_name: &str,
         network_ip: &str,
         container_number_label: &str,
     ) -> Option<(String, String)> {
-        let lb_service_name = labels
-            .iter()
-            .find(|(k, _)| k.ends_with("/loadbalancer/server/port"))
-            .map(|(k, _)| {
-                k.split("/")
-                    .nth(3)
-                    .expect("service name not found in traefik label")
-                    .to_string()
-            })
-            .or_else(|| None);
-
+        let key = format!(
+            "traefik/http/services/{}/loadbalancer/server/port",
+            service_name
+        );
         let lb_service_port = labels
             .iter()
-            .find(|(k, _)| k.ends_with("/loadbalancer/server/port"))
-            .map(|(_, v)| v.as_str())
+            .find(|(k, _)| k == &key)
+            .map(|(_, v)| v.to_string())
             .or_else(|| None);
 
-        match (lb_service_name, lb_service_port) {
-            (Some(service_name), Some(service_port)) => {
+        match lb_service_port {
+            Some(service_port) => {
                 let service_url = format!("http://{}:{}", network_ip, service_port);
                 let service_container_index = container_number_label.parse::<i32>().unwrap() - 1;
 
@@ -106,29 +101,25 @@ impl<'a> Client<'a> {
         }
     }
 
-    fn build_router_service_configuration(
-        &self,
-        labels: &Vec<(String, String)>,
-    ) -> Option<(String, String)> {
-        let service_name = labels
+    fn build_router_service_configuration(&self, service_name: &str) -> Option<(String, String)> {
+        Some((
+            format!("traefik/http/routers/{}/service", service_name),
+            service_name.into(),
+        ))
+    }
+
+    fn implicit_service_name(&self, labels: &Vec<(String, String)>) -> Vec<String> {
+        let service_names = labels
             .iter()
-            .find(|(k, _)| k.starts_with("traefik/http/routers/"))
+            .filter(|(k, _)| k.starts_with("traefik/http/services/"))
             .map(|(k, _)| {
                 k.split("/")
                     .nth(3)
                     .expect("service name not found in traefik label")
                     .to_string()
             })
-            .or_else(|| None);
-
-        match service_name {
-            Some(service_name) => Some((
-                format!("traefik/http/routers/{}/service", service_name),
-                service_name.into(),
-            )),
-
-            _ => None,
-        }
+            .collect();
+        service_names
     }
 
     fn parse_containers(&mut self, json: Value) -> Vec<Vec<(String, String)>> {
@@ -164,21 +155,26 @@ impl<'a> Client<'a> {
                     .as_str()
                     .unwrap();
 
-                let lb_config = self.build_lb_server_configuration(
-                    &traefik_labels,
-                    &container_network_ip,
-                    container_number_label,
-                );
+                let service_names = self.implicit_service_name(&traefik_labels);
 
-                if lb_config.is_some() {
-                    traefik_labels.push(lb_config.unwrap());
-                }
+                for service_name in service_names {
+                    let lb_config = self.build_lb_server_configuration(
+                        &traefik_labels,
+                        &service_name,
+                        &container_network_ip,
+                        container_number_label,
+                    );
 
-                let router_service_config =
-                    self.build_router_service_configuration(&traefik_labels);
+                    if lb_config.is_some() {
+                        traefik_labels.push(lb_config.unwrap());
+                    }
 
-                if router_service_config.is_some() {
-                    traefik_labels.push(router_service_config.unwrap());
+                    let router_service_config =
+                        self.build_router_service_configuration(&service_name);
+
+                    if router_service_config.is_some() {
+                        traefik_labels.push(router_service_config.unwrap());
+                    }
                 }
 
                 traefik_labels.retain(|(k, _)| !k.ends_with("/loadbalancer/server/port"));
