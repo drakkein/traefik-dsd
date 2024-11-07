@@ -11,10 +11,14 @@ use tokio::net::UnixStream;
 pub struct Client<'a> {
     sender: hyper::client::conn::http1::SendRequest<Body>,
     docker_network: &'a str,
+    host_ip: &'a str,
 }
 
 impl<'a> Client<'a> {
-    pub async fn new(docker_network: &'a str) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new(
+        docker_network: &'a str,
+        host_ip: &'a str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let path = PathBuf::from("/var/run/docker.sock");
         let stream = TokioIo::new(UnixStream::connect(path).await?);
 
@@ -29,6 +33,7 @@ impl<'a> Client<'a> {
         Ok(Client {
             sender,
             docker_network,
+            host_ip,
         })
     }
 
@@ -53,10 +58,16 @@ impl<'a> Client<'a> {
     }
 
     fn is_valid_container(&self, container: &Value) -> bool {
-        container["NetworkSettings"]["Networks"]
-            .as_object()
-            .map(|networks| networks.contains_key(self.docker_network))
-            .unwrap_or(false)
+        let is_valid_network = if !self.docker_network.is_empty() {
+            container["NetworkSettings"]["Networks"]
+                .as_object()
+                .map(|networks| networks.contains_key(self.docker_network))
+                .unwrap_or(false)
+        } else {
+            true
+        };
+
+        is_valid_network
             && container["Labels"]
                 .as_object()
                 .map(|labels| labels.contains_key("com.docker.compose.service"))
@@ -144,11 +155,14 @@ impl<'a> Client<'a> {
                     })
                     .collect();
 
-                let container_network_ip = container["NetworkSettings"]["Networks"]
-                    [self.docker_network]["IPAddress"]
-                    .as_str()
-                    .unwrap()
-                    .to_string();
+                let container_network_ip = if !self.docker_network.is_empty() {
+                    container["NetworkSettings"]["Networks"][self.docker_network]["IPAddress"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                } else {
+                    self.host_ip.to_string()
+                };
 
                 let container_number_label = container["Labels"]
                     ["com.docker.compose.container-number"]
