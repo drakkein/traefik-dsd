@@ -47,3 +47,4 @@ curl -v -H "Host: myapp.example.com" http://127.0.0.1/
 |REDIS_URL|URL to your `redis/valkey` instance|-|
 |DOCKER_NETWORK|Name of your overlay network|-|
 |REDIS_TTL|Expiry time of created records. Discovery loop starts 5s before| 60|
+|HOST_IP|IP address that will be passed to loadbalancer config instead of container IP|-|
